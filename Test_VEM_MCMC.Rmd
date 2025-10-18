@@ -1,0 +1,1058 @@
+---
+title: "Untitled"
+output: html_document
+date: "2025-09-30"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+rm(list=ls())
+```
+
+```{r}
+library(ggplot2)
+library(reshape2)
+library(mclust)
+library(clue)
+library(combinat)
+library(dplyr)
+library(tibble)
+library(tidyr)
+library(sbm)
+library(gtools)
+```
+
+# Estimation Algorithms for the Latent Block Model
+
+## 1. Function
+
+### Simulation LBM
+
+```{r}
+#Simulate LBM 
+simulate_LBM <- function(n, m, K, L, pi, rho, gamma){
+  Z <- sample(1:K, n, replace = TRUE, prob = pi)
+  W <- sample(1:L, m, replace = TRUE, prob = rho)
+  Y <- matrix(0, n, m)
+  for (i in 1:n) {
+    for (j in 1:m) {
+      prob <- gamma[Z[i], W[j]]
+      Y[i,j] <- rbinom(1, 1, prob) # acording to binomial law
+    }
+  }
+  list(Y = Y, Z = Z, W = W)
+}
+```
+
+### Gibbs Sampler
+
+```{r}
+# Gibbs sampler
+gibbs_LBM <- function(Y, K, L, n_iter = 1000, a = 1, b = 1, alpha = rep(1,K), beta = rep(1,L)) {
+  n <- nrow(Y)
+  m <- ncol(Y)
+  
+  # Random init
+  Z <- sample(1:K, n, replace = TRUE)
+  W <- sample(1:L, m, replace = TRUE)
+  Lambda <- matrix(runif(K*L, 0.3, 0.7), nrow = K)
+  pi <- rep(1/K, K)
+  rho <- rep(1/L, L)
+  
+  # Stockage des tirages
+  Z_store <- matrix(0, n_iter, n)
+  W_store <- matrix(0, n_iter, m)
+  Lambda_store <- array(0, dim = c(n_iter, K, L))
+  
+  for (iter in 1:n_iter) {
+    
+    ## --- 1. Mettre à jour Z ---
+    for (i in 1:n) {
+      probs <- rep(0, K)
+      for (q in 1:K) {
+        logp <- log(pi[q])
+        for (j in 1:m) {
+          l <- W[j]
+          yij <- Y[i,j]
+          logp <- logp + yij * log(Lambda[q,l]) + (1-yij) * log(1-Lambda[q,l])
+        }
+        probs[q] <- exp(logp)
+      }
+      probs <- probs / sum(probs)
+      Z[i] <- sample(1:K, 1, prob = probs)
+    }
+    
+    ## --- 2. Mettre à jour W ---
+    for (j in 1:m) {
+      probs <- rep(0, L)
+      for (l in 1:L) {
+        logp <- log(rho[l])
+        for (i in 1:n) {
+          q <- Z[i]
+          yij <- Y[i,j]
+          logp <- logp + yij * log(Lambda[q,l]) + (1-yij) * log(1-Lambda[q,l])
+        }
+        probs[l] <- exp(logp)
+      }
+      probs <- probs / sum(probs)
+      W[j] <- sample(1:L, 1, prob = probs)
+    }
+    
+    ## --- 3. Mettre à jour Lambda ---
+    for (q in 1:K) {
+      for (l in 1:L) {
+        y_q_l <- Y[Z == q, , drop = FALSE][ ,W == l, drop = FALSE]
+        sum_y <- sum(y_q_l)
+        n_links <- length(y_q_l)
+        Lambda[q,l] <- rbeta(1, a + sum_y, b + n_links - sum_y)
+      }
+    }
+    
+    ## --- 4. Mettre à jour pi et rho ---
+    pi <- as.numeric(gtools::rdirichlet(1, alpha + tabulate(Z, nbins = K)))
+    rho <- as.numeric(gtools::rdirichlet(1, beta + tabulate(W, nbins = L)))
+    
+    ## --- Stocker les tirages ---
+    Z_store[iter,] <- Z
+    W_store[iter,] <- W
+    Lambda_store[iter,,] <- Lambda
+    
+    if (iter %% 100 == 0) cat("Itération", iter, "terminée\n")
+  }
+  
+  list(Z = Z_store, W = W_store, Lambda = Lambda_store)
+}
+```
+
+### Generate Param LBM
+
+```{r}
+# Init param LBM (lambda, pi, rho)
+initialize_LBM_params <- function(K, 
+                                   L, 
+                                   pi_init = NULL, 
+                                   rho_init = NULL, 
+                                   Lambda_init = NULL,
+                                   lambda_min = 0.01,
+                                   lambda_max = 0.99,
+                                   dirichlet_alpha = 1,
+                                   seed = NULL) {
+  
+  if (!is.null(seed)) set.seed(seed)
+  
+  # Validation des entrées
+  stopifnot(K >= 1, L >= 1)
+  stopifnot(lambda_min >= 0, lambda_max <= 1, lambda_min < lambda_max)
+  stopifnot(dirichlet_alpha > 0)
+  
+  # ---- Initialisation de pi (proportions des clusters lignes) ----
+  if (is.null(pi_init)) {
+    # Utiliser une distribution de Dirichlet
+    # Si alpha = 1 : uniforme, alpha < 1 : sparse, alpha > 1 : équilibré
+    pi <- rdirichlet(1, rep(dirichlet_alpha, K))
+    pi <- as.numeric(pi)
+  } else {
+    stopifnot(length(pi_init) == K, all(pi_init > 0), abs(sum(pi_init) - 1) < 1e-6)
+    pi <- pi_init
+  }
+  
+  # ---- Initialisation de rho (proportions des clusters colonnes) ----
+  if (is.null(rho_init)) {
+    rho <- rdirichlet(1, rep(dirichlet_alpha, L))
+    rho <- as.numeric(rho)
+  } else {
+    stopifnot(length(rho_init) == L, all(rho_init > 0), abs(sum(rho_init) - 1) < 1e-6)
+    rho <- rho_init
+  }
+  
+  # ---- Initialisation de Lambda (matrice de connectivité K x L) ----
+  if (is.null(Lambda_init)) {
+    # Générer des probabilités uniformes entre lambda_min et lambda_max
+    Lambda <- matrix(runif(K * L, min = lambda_min, max = lambda_max), 
+                     nrow = K, ncol = L)
+  } else {
+    stopifnot(is.matrix(Lambda_init), 
+              nrow(Lambda_init) == K, 
+              ncol(Lambda_init) == L,
+              all(Lambda_init >= 0), 
+              all(Lambda_init <= 1))
+    Lambda <- Lambda_init
+  }
+  
+  # Retourner les paramètres
+  params <- list(
+    K = K,
+    L = L,
+    pi = pi,
+    rho = rho,
+    Lambda = Lambda
+  )
+  
+  return(params)
+}
+```
+
+### Dirichlet Distribution
+
+```{r}
+# Dirichlet distribution
+rdirichlet <- function(n, alpha) {
+  k <- length(alpha)
+  samples <- matrix(0, nrow = n, ncol = k)
+  
+  for (i in 1:n) {
+    # Générer des variables Gamma
+    gamma_samples <- rgamma(k, shape = alpha, rate = 1)
+    # Normaliser pour obtenir des probabilités
+    samples[i, ] <- gamma_samples / sum(gamma_samples)
+  }
+  
+  return(samples)
+}
+```
+
+### Print param LBM
+
+```{r}
+print_LBM_params <- function(params) {
+  cat("========================================\n")
+  cat("Paramètres du Latent Block Model\n")
+  cat("========================================\n\n")
+  
+  cat("Nombre de clusters lignes (K):", params$K, "\n")
+  cat("Nombre de clusters colonnes (L):", params$L, "\n\n")
+  
+  cat("Proportions des clusters lignes (pi):\n")
+  print(round(params$pi, 4))
+  cat("Somme:", round(sum(params$pi), 6), "\n\n")
+  
+  cat("Proportions des clusters colonnes (rho):\n")
+  print(round(params$rho, 4))
+  cat("Somme:", round(sum(params$rho), 6), "\n\n")
+  
+  cat("Matrice de connectivité Lambda (K x L):\n")
+  print(round(params$Lambda, 3))
+  cat("\n")
+  
+  # Statistiques sur Lambda
+  cat("Statistiques sur Lambda:\n")
+  cat("  Min:", round(min(params$Lambda), 3), "\n")
+  cat("  Max:", round(max(params$Lambda), 3), "\n")
+  cat("  Moyenne:", round(mean(params$Lambda), 3), "\n")
+  cat("  Médiane:", round(median(params$Lambda), 3), "\n")
+  cat("========================================\n")
+}
+```
+
+### Algorithme VEM
+
+```{r}
+VEM_LBM <- function(Y, K, L, max_iter = 200, tol = 1e-6, soft_init = 0.9) {
+  n <- as.integer(nrow(Y))
+  m <- as.integer(ncol(Y))
+  K <- as.integer(K)
+  L <- as.integer(L)
+
+ 
+  set.seed(123)  # pour reproductibilité
+  km_rows <- kmeans(Y, centers = K, nstart = 10)
+  tau <- matrix(0, n, K)
+  tau[cbind(1:n, km_rows$cluster)] <- 1  # assignations dures
+  tau <- tau * soft_init + (1 - soft_init) / K  # adoucir un peu (soft_init ≈ 0.9)
+  tau <- tau / rowSums(tau)
+
+  # Pour les colonnes (xi)
+  set.seed(456)
+  km_cols <- kmeans(t(Y), centers = L, nstart = 10)
+  xi <- matrix(0, m, L)
+  xi[cbind(1:m, km_cols$cluster)] <- 1
+  xi <- xi * soft_init + (1 - soft_init) / L
+  xi <- xi / rowSums(xi)
+  
+  # Proportions et Lambda
+  pi <- colMeans(tau)
+  rho <- colMeans(xi)
+  Lambda <- matrix(runif(K * L, 0.3, 0.7), K, L)
+  
+  # Stockage des tirages
+  pi_store <- matrix(0, max_iter, K)
+  rho_store <- matrix(0, max_iter, L)
+  tau_store <- array(0, dim = c(max_iter, n, K))
+  xi_store <- array(0, dim = c(max_iter, m, L))
+  Lambda_store <- array(0, dim = c(max_iter, K, L))
+  elbo_store <- rep(0,max_iter)
+  elbo_prev <- -Inf
+  
+  n_iter <- max_iter
+  for (iter in 1:max_iter) {
+    ### --- M-step ---
+    pi <- colMeans(tau)
+    rho <- colMeans(xi)
+
+    Lambda_new <- matrix(0, K, L)
+    for (q in 1:K) {
+      for (l in 1:L) {
+        num <- sum(tau[,q] %*% t(xi[,l]) * Y)  # équivalent à double boucle
+        den <- sum(tau[,q]) * sum(xi[,l])      # somme pondérée
+        Lambda_new[q,l] <- ifelse(den > 0, num/den, 0.01)
+      }
+    }
+    Lambda <- pmin(pmax(Lambda_new, 1e-6), 1-1e-6) # éviter 0 ou 1 exacts
+
+    ### --- V-step : mise à jour tau ---
+    log_tau <- matrix(0, n, K)
+    for (i in 1:n) {
+      for (q in 1:K) {
+        sum_prob <- 0
+        for (j in 1:m) {
+          for (l in 1:L) {
+            y_ij <- Y[i,j]
+            sum_prob <- sum_prob + xi[j,l] * (y_ij * log(Lambda[q,l]) + 
+                                                 (1 - y_ij) * log(1 - Lambda[q,l]))
+          }
+        }
+        log_tau[i,q] <- log(pi[q]) + sum_prob
+      }
+    }
+    tau <- exp(log_tau)
+    tau <- tau / rowSums(tau)
+
+    ### --- V-step : mise à jour xi ---
+    log_xi <- matrix(0, m, L)
+    for (j in 1:m) {
+      for (l in 1:L) {
+        sum_prob <- 0
+        for (i in 1:n) {
+          for (q in 1:K) {
+            y_ij <- Y[i,j]
+            sum_prob <- sum_prob + tau[i,q] * (y_ij * log(Lambda[q,l]) + 
+                                               (1 - y_ij) * log(1 - Lambda[q,l]))
+          }
+        }
+        log_xi[j,l] <- log(rho[l]) + sum_prob
+      }
+    }
+    xi <- exp(log_xi)
+    xi <- xi / rowSums(xi)
+
+    ### --- Critère de convergence (ELBO approx) ---
+    elbo <- sum(log(rowSums(exp(log_tau)))) + sum(log(rowSums(exp(log_xi))))
+    elbo_store[iter] <- elbo
+    if (abs(elbo - elbo_prev) < tol){
+      n_iter <- iter-1
+      break
+    }
+    elbo_prev <- elbo
+    
+    ## --- Stocker les tirages ---
+    pi_store[iter,] <- pi
+    rho_store[iter,] <- rho
+    Lambda_store[iter,,] <- Lambda
+    tau_store[iter,,] <- tau
+    xi_store[iter,,] <- xi
+    if (iter %% 20 == 0) cat("Itération", iter, "terminée\n")
+  }
+
+  list(tau = tau_store, xi = xi_store, pi = pi_store, rho = rho_store, Lambda = Lambda_store, elbo = elbo_store, n_iter=n_iter)
+}
+```
+
+### Comparison MCMC VEM
+
+```{r}
+compare_MCMC_VEM <- function(params, N, M, n_iter_mcmc = 200, n_iter_vem = 200) {
+  
+  # Stocker tous les résultats
+  all_results <- list()
+  result_index <- 1
+  
+  total_combinations <- length(N) * length(M)
+  current_combination <- 0
+  
+  for (n in N) {
+    for (m in M) {
+      current_combination <- current_combination + 1
+      size_label <- paste0(n, "×", m)
+      
+      cat("\n========================================\n")
+      cat("Progress:", current_combination, "/", total_combinations, "\n")
+      cat("Taille:", size_label, "\n")
+      cat("========================================\n")
+      
+      # Simuler les données
+      sim <- simulate_LBM(n, m, params$K, params$L, 
+                          params$pi, params$rho, params$Lambda)
+      
+      # --- MCMC (Gibbs sampling) ---
+      cat("  Running MCMC (Gibbs)...\n")
+      res_MCMC <- gibbs_LBM(sim$Y, params$K, params$L, n_iter = n_iter_mcmc)
+      
+      # Calculer ARI à chaque itération
+      ari_mcmc_rows <- sapply(1:nrow(res_MCMC$Z), function(iter) {
+        adjustedRandIndex(sim$Z, res_MCMC$Z[iter, ])
+      })
+      
+      ari_mcmc_cols <- sapply(1:nrow(res_MCMC$W), function(iter) {
+        adjustedRandIndex(sim$W, res_MCMC$W[iter, ])
+      })
+      
+      df_mcmc <- data.frame(
+        iteration = 1:length(ari_mcmc_rows),
+        ARI_rows = ari_mcmc_rows,
+        ARI_cols = ari_mcmc_cols,
+        method = "MCMC",
+        size = size_label,
+        n = n,
+        m = m
+      )
+      
+      # --- VEM ---
+      cat("  Running VEM...\n")
+      res_VEM <- VEM_LBM(sim$Y, params$K, params$L, max_iter = n_iter_vem)
+      
+      # Calculer ARI à chaque itération
+      ari_vem_rows <- sapply(1:res_VEM$n_iter, function(iter) {
+        adjustedRandIndex(sim$Z, apply(res_VEM$tau[iter,,], 1, which.max))
+      })
+      
+      ari_vem_cols <- sapply(1:res_VEM$n_iter, function(iter) {
+        adjustedRandIndex(sim$W, apply(res_VEM$xi[iter,,], 1, which.max))
+      })
+      
+      df_vem <- data.frame(
+        iteration = 1:length(ari_vem_rows),
+        ARI_rows = ari_vem_rows,
+        ARI_cols = ari_vem_cols,
+        method = "VEM",
+        size = size_label,
+        n = n,
+        m = m
+      )
+      
+      # Stocker
+      all_results[[result_index]] <- rbind(df_mcmc, df_vem)
+      result_index <- result_index + 1
+      
+      cat("  ARI final MCMC (rows):", round(tail(ari_mcmc_rows, 1), 3), "\n")
+      cat("  ARI final VEM  (rows):", round(tail(ari_vem_rows, 1), 3), "\n")
+      cat("  ARI final MCMC (cols):", round(tail(ari_mcmc_cols, 1), 3), "\n")
+      cat("  ARI final VEM  (cols):", round(tail(ari_vem_cols, 1), 3), "\n")
+    }
+  }
+  
+  # Combiner tous les résultats
+  results_df <- do.call(rbind, all_results)
+  
+  return(results_df)
+}
+
+```
+
+### Plot comparison curves
+
+```{r}
+plot_all_curves_nm <- function(results, n, m) {
+  
+  # Créer la légende combinée
+  results$legend_label <- paste0(results$method, " - K=", results$K, ", L=", results$L)
+  results_MCMC <- dplyr::filter(results, method == "MCMC")
+  results_VEM  <- dplyr::filter(results, method == "VEM")
+  
+  size_label <- paste0("n = ", n, ", m = ", m)
+  
+  # --- MCMC - Rows ---
+  p_rows_MCMC <- ggplot(results_MCMC, aes(x = iteration, y = ARI_rows, 
+                                          color = legend_label, group = legend_label)) +
+    geom_line(linewidth = 1, alpha = 0.8) +
+    labs(title = paste0("ARI MCMC - Rows Clustering (", size_label, ")"),
+         x = "Iteration",
+         y = "ARI",
+         color = "Method - (K, L)") +
+    ylim(-0.5, 1) +
+    geom_hline(yintercept = 1, linetype = "dashed", color = "gray40", alpha = 0.5) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(face = "bold", size = 14),
+      legend.position = "right",
+      legend.text = element_text(size = 9)
+    )
+  
+  # --- MCMC - Columns ---
+  p_cols_MCMC <- ggplot(results_MCMC, aes(x = iteration, y = ARI_cols, 
+                                          color = legend_label, group = legend_label)) +
+    geom_line(linewidth = 1, alpha = 0.8) +
+    labs(title = paste0("ARI MCMC - Columns Clustering (", size_label, ")"),
+         x = "Iteration",
+         y = "ARI",
+         color = "Method - (K, L)") +
+    ylim(-0.5, 1) +
+    geom_hline(yintercept = 1, linetype = "dashed", color = "gray40", alpha = 0.5) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(face = "bold", size = 14),
+      legend.position = "right",
+      legend.text = element_text(size = 9)
+    )
+  
+  # --- VEM - Rows ---
+  p_rows_VEM <- ggplot(results_VEM, aes(x = iteration, y = ARI_rows, 
+                                        color = legend_label, group = legend_label)) +
+    geom_line(linewidth = 1, alpha = 0.8) +
+    labs(title = paste0("ARI VEM - Rows Clustering (", size_label, ")"),
+         x = "Iteration",
+         y = "ARI",
+         color = "Method - (K, L)") +
+    ylim(-0.5, 1) +
+    geom_hline(yintercept = 1, linetype = "dashed", color = "gray40", alpha = 0.5) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(face = "bold", size = 14),
+      legend.position = "right",
+      legend.text = element_text(size = 9)
+    )
+  
+  # --- VEM - Columns ---
+  p_cols_VEM <- ggplot(results_VEM, aes(x = iteration, y = ARI_cols, 
+                                        color = legend_label, group = legend_label)) +
+    geom_line(linewidth = 1, alpha = 0.8) +
+    labs(title = paste0("ARI VEM - Columns Clustering (", size_label, ")"),
+         x = "Iteration",
+         y = "ARI",
+         color = "Method - (K, L)") +
+    ylim(-0.5, 1) +
+    geom_hline(yintercept = 1, linetype = "dashed", color = "gray40", alpha = 0.5) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(face = "bold", size = 14),
+      legend.position = "right",
+      legend.text = element_text(size = 9)
+    )
+  
+  # Retourner les 4 graphes
+  return(list(
+    p_rows_MCMC = p_rows_MCMC,
+    p_cols_MCMC = p_cols_MCMC,
+    p_rows_VEM  = p_rows_VEM,
+    p_cols_VEM  = p_cols_VEM
+  ))
+}
+```
+
+### Algorithme EM
+
+```{r}
+
+loglik_complete <- function(Y, Z, W, pi, rho, Lambda) {
+  n <- nrow(Y); m <- ncol(Y)
+  ll <- sum(log(pi[Z])) + sum(log(rho[W]))
+  for (i in 1:n) {
+    for (j in 1:m) {
+      p <- Lambda[Z[i], W[j]]
+      ll <- ll + ifelse(Y[i,j]==1, log(p), log(1-p))
+    }
+  }
+  ll
+}
+
+# Enumerate all partitions (brute force!)
+all_partitions <- function(n, K) {
+  expand.grid(rep(list(1:K), n))
+}
+
+EM_LBM <- function(Y, K, L, max_iter=50, tol=1e-6) {
+  n <- nrow(Y); m <- ncol(Y)
+  
+  # init params
+  pi <- rep(1/K, K)
+  rho <- rep(1/L, L)
+  Lambda <- matrix(runif(K*L, 0.3, 0.7), K, L)
+  
+  # Precompute all partitions
+  allZ <- as.matrix(all_partitions(n, K))
+  allW <- as.matrix(all_partitions(m, L))
+  
+  loglik_trace <- c()
+  
+  for (iter in 1:max_iter) {
+    # ---- E-step: compute posterior weights over (Z,W)
+    weights <- c()
+    for (a in 1:nrow(allZ)) {
+      for (b in 1:nrow(allW)) {
+        ll <- loglik_complete(Y, allZ[a,], allW[b,], pi, rho, Lambda)
+        weights <- c(weights, ll)
+      }
+    }
+    # normalize
+    logliks <- weights
+    log_norm <- logsumexp(logliks)
+    probs <- exp(logliks - log_norm)
+    
+    # ---- M-step: expected counts
+    pi_new <- rep(0, K)
+    rho_new <- rep(0, L)
+    Lambda_num <- matrix(0, K, L)
+    Lambda_den <- matrix(0, K, L)
+    
+    idx <- 1
+    for (a in 1:nrow(allZ)) {
+      for (b in 1:nrow(allW)) {
+        w <- probs[idx]; idx <- idx+1
+        Z <- allZ[a,]; W <- allW[b,]
+        
+        for (i in 1:n) pi_new[Z[i]] <- pi_new[Z[i]] + w
+        for (j in 1:m) rho_new[W[j]] <- rho_new[W[j]] + w
+        for (i in 1:n) {
+          for (j in 1:m) {
+            Lambda_num[Z[i], W[j]] <- Lambda_num[Z[i], W[j]] + w*Y[i,j]
+            Lambda_den[Z[i], W[j]] <- Lambda_den[Z[i], W[j]] + w
+          }
+        }
+      }
+    }
+    
+    pi_new <- pi_new / n
+    rho_new <- rho_new / m
+    Lambda_new <- Lambda_num / Lambda_den
+    
+    # update
+    pi <- pi_new; rho <- rho_new; Lambda <- Lambda_new
+    
+    loglik_trace <- c(loglik_trace, log_norm)
+    
+    # convergence
+    if (iter>1 && abs(loglik_trace[iter]-loglik_trace[iter-1])<tol) break
+  }
+  
+  list(pi=pi, rho=rho, Lambda=Lambda, loglik=loglik_trace)
+}
+
+# Helper: log-sum-exp
+logsumexp <- function(x) {
+  m <- max(x)
+  m + log(sum(exp(x-m)))
+}
+```
+
+```{r}
+# -----------------------
+# Example run
+# -----------------------
+set.seed(123)
+K <- 2; L <- 2
+pi <- rep(1/K, K)      # row cluster prior
+rho <- rep(1/L, L)     # col cluster prior
+Lambda <- matrix(runif(K*L, 0.2, 0.8), K, L)  # connection probs
+toy <- simulate_LBM(n=2, m=2, K, L, pi, rho, Lambda)
+fit <- EM_LBM(toy$Y, K=2, L=2, max_iter=20)
+
+print(fit$Lambda)
+plot(fit$loglik, type="b", main="Log-likelihood trace", ylab="loglik", xlab="iter")
+```
+
+## 2. Comparison ARI MCMC & VEM
+
+```{r}
+## Protocole pour test sur plusieurs LBM
+K <- c(2,4,8)
+L <- c(2,4,8)
+N <- c(10, 50, 100, 200)
+M <- c(10, 50, 100, 200)
+params <- initialize_LBM_params(K = 2, L = 2, seed = 123)
+ARI_params22 <- compare_MCMC_VEM(params,N,M)
+params <- initialize_LBM_params(K = 2, L = 4, seed = 123)
+ARI_params24 <- compare_MCMC_VEM(params,N,M)
+params <- initialize_LBM_params(K = 2, L = 8, seed = 123)
+ARI_params28 <- compare_MCMC_VEM(params,N,M)
+params <- initialize_LBM_params(K = 4, L = 2, seed = 123)
+ARI_params42 <- compare_MCMC_VEM(params,N,M)
+params <- initialize_LBM_params(K = 4, L = 4, seed = 123)
+ARI_params44 <- compare_MCMC_VEM(params,N,M)
+params <- initialize_LBM_params(K = 4, L = 8, seed = 123)
+ARI_params48 <- compare_MCMC_VEM(params,N,M)
+params <- initialize_LBM_params(K = 8, L = 8, seed = 123)
+ARI_params88 <- compare_MCMC_VEM(params,N,M)
+```
+
+```{r}
+# Création dataframe
+ARI_params22$K <- 2
+ARI_params22$L <- 2
+ARI_params24$K <- 2
+ARI_params24$L <- 4
+ARI_params28$K <- 2
+ARI_params28$L <- 8
+ARI_params42$K <- 4
+ARI_params42$L <- 2
+ARI_params44$K <- 4
+ARI_params44$L <- 4
+ARI_params48$K <- 4
+ARI_params48$L <- 8
+ARI_params88$K <- 8
+ARI_params88$L <- 8
+
+all_ARI <- dplyr::bind_rows(
+  ARI_params22,
+  ARI_params24,
+  ARI_params28,
+  ARI_params42,
+  ARI_params44,
+  ARI_params48,
+  ARI_params88
+)
+
+all_ARI <- all_ARI %>%
+  dplyr::mutate(size = paste0(n, "x", m))
+
+ARI_by_size <- split(all_ARI, all_ARI$size)
+```
+
+```{r}
+plot_all_curves_nm(ARI_by_size[["10x10"]], n=10, m=10)
+plot_all_curves_nm(ARI_by_size[["10x50"]], n=10, m=50)
+plot_all_curves_nm(ARI_by_size[["10x100"]], n=10, m=100)
+plot_all_curves_nm(ARI_by_size[["10x200"]], n=10, m=200)
+plot_all_curves_nm(ARI_by_size[["50x10"]], n=50, m=10)
+plot_all_curves_nm(ARI_by_size[["50x50"]], n=50, m=50)
+plot_all_curves_nm(ARI_by_size[["50x100"]], n=50, m=100)
+plot_all_curves_nm(ARI_by_size[["50x200"]], n=50, m=200)
+plot_all_curves_nm(ARI_by_size[["100x10"]], n=100, m=10)
+plot_all_curves_nm(ARI_by_size[["100x50"]], n=100, m=50)
+plot_all_curves_nm(ARI_by_size[["100x100"]], n=100, m=100)
+plot_all_curves_nm(ARI_by_size[["100x200"]], n=100, m=200)
+plot_all_curves_nm(ARI_by_size[["200x10"]], n=200, m=10)
+plot_all_curves_nm(ARI_by_size[["200x50"]], n=200, m=50)
+plot_all_curves_nm(ARI_by_size[["200x100"]], n=200, m=100)
+plot_all_curves_nm(ARI_by_size[["200x200"]], n=200, m=200)
+```
+
+## 3. Test on real dataset
+
+```{r}
+load(file="Rdata/p_herb_LBM.Rdata")
+load(file="Rdata/d_herb_LBM.Rdata")
+load(file="Rdata/p_pred_LBM.Rdata")
+load(file="Rdata/d_pred_LBM.Rdata")
+load(file="Rdata/p_herb_mat.Rdata")
+load(file="Rdata/d_herb_mat.Rdata")
+load(file="Rdata/p_pred_mat.Rdata")
+load(file="Rdata/d_pred_mat.Rdata")
+```
+
+```{r}
+par(mfrow = c(2, 2)) 
+plot(p_herb_LBM, type  = 'meso', 
+     dimLabels = list(row = 'plantes', col= 'herbivores'),
+     plotOptions = list(edge.width = 1, vertex.size = c(3,3), title="p_herb"))
+plot(d_herb_LBM, type  = 'meso', 
+     dimLabels = list(row = 'plantes', col= 'herbivores'),
+     plotOptions = list(edge.width = 1, vertex.size = c(3,3), title="d_herb"))
+plot(p_pred_LBM, type  = 'meso', 
+     dimLabels = list(row = 'proies', col= 'prédateurs'),
+     plotOptions = list(edge.width = 1, vertex.size = c(3,3), title="p_pred"))
+plot(d_pred_LBM, type  = 'meso', 
+     dimLabels = list(row = 'proies', col= 'prédateurs'),
+     plotOptions = list(edge.width = 1, vertex.size = c(3,3), title="d_pred"))
+```
+
+```{r}
+res_VEM_p_pred <- VEM_LBM(p_pred_mat, p_pred_LBM$nbBlocks[1], p_pred_LBM$nbBlocks[2])
+res_MCMC_p_pred <- gibbs_LBM(p_pred_mat, p_pred_LBM$nbBlocks[1], p_pred_LBM$nbBlocks[2], n_iter = 100)
+
+# --- Compute ARI for both algorithms ---
+i_VEM <- 1:res_VEM_p_pred$n_iter
+i_MCMC <- 1:100
+
+# --- VEM ---
+ari_cols_VEM <- sapply(i_VEM, function(iter) {
+  adjustedRandIndex(p_pred_LBM$memberships$prédateurs, apply(res_VEM_p_pred$xi[iter,,], 1, which.max))
+})
+
+ari_rows_VEM <- sapply(i_VEM, function(iter) {
+  adjustedRandIndex(p_pred_LBM$memberships$proies, apply(res_VEM_p_pred$tau[iter,,], 1, which.max))
+})
+
+df_VEM <- data.frame(
+  iteration = rep(i_VEM, 2),
+  ARI = c(ari_rows_VEM, ari_cols_VEM),
+  Type = factor(rep(c("Preys", "Predators"), each = length(i_VEM))),
+  Method = "VEM"
+)
+
+# --- MCMC ---
+ari_cols_MCMC <- sapply(i_MCMC, function(iter) {
+  adjustedRandIndex(p_pred_LBM$memberships$prédateurs, res_MCMC_p_pred$W[iter, ])
+})
+
+ari_rows_MCMC <- sapply(i_MCMC, function(iter) {
+  adjustedRandIndex(p_pred_LBM$memberships$proies, res_MCMC_p_pred$Z[iter, ])
+})
+
+df_MCMC <- data.frame(
+  iteration = rep(i_MCMC, 2),
+  ARI = c(ari_rows_MCMC, ari_cols_MCMC),
+  Type = factor(rep(c("Preys", "Predators"), each = length(i_MCMC))),
+  Method = "MCMC"
+)
+
+# --- Combine both ---
+df_all <- rbind(df_VEM, df_MCMC)
+
+# --- Création du label combiné ---
+df_all$Label <- paste(df_all$Method, df_all$Type, sep = " - ")
+
+# --- Définir les couleurs pour les 4 courbes ---
+custom_colors <- c(
+  "MCMC - Plants" = "#D95F02",     # orange
+  "MCMC - Herbivores" = "#1B9E77",  # vert
+  "VEM - Plants" = "#7570B3",      # violet
+  "VEM - Herbivores" = "#E7298A",    # rose/rouge
+  "MCMC - Preys" = "#D95F02",     # orange
+  "MCMC - Predators" = "#1B9E77",  # vert
+  "VEM - Preys" = "#7570B3",      # violet
+  "VEM - Predators" = "#E7298A"    # rose/rouge
+)
+
+# --- Tracé combiné ---
+p_all <- ggplot(df_all, aes(x = iteration, y = ARI, color = Label)) +
+  geom_line(linewidth = 1) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "gray50", linewidth = 0.5) +
+  annotate("rect", xmin = 100, xmax = max(df_all$iteration), ymin = -Inf, ymax = Inf, 
+           alpha = 0.1, fill = "red") +
+  labs(
+    title = "Adjusted Rand Index Convergence",
+    subtitle = "Predation Network - Pristine Island",
+    x = "Iteration",
+    y = "ARI",
+    color = "Method - Clustering"
+  ) +
+  scale_color_manual(values = custom_colors) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    legend.position = "bottom",
+    legend.box = "vertical",
+    legend.title = element_text(size = 10, face = "bold"),
+    legend.text = element_text(size = 9)
+  )
+
+print(p_all)
+
+
+```
+
+```{r}
+res_VEM_p_herb <- VEM_LBM(p_herb_mat, p_herb_LBM$nbBlocks[1], p_herb_LBM$nbBlocks[2])
+res_MCMC_p_herb <- gibbs_LBM(p_herb_mat, p_herb_LBM$nbBlocks[1], p_herb_LBM$nbBlocks[2], n_iter = 100)
+
+# --- Compute ARI for both algorithms ---
+i_VEM <- 1:res_VEM_p_herb$n_iter
+i_MCMC <- 1:100
+
+# --- VEM ---
+ari_cols_VEM <- sapply(i_VEM, function(iter) {
+  adjustedRandIndex(p_herb_LBM$memberships$herbivores, apply(res_VEM_p_herb$xi[iter,,], 1, which.max))
+})
+
+ari_rows_VEM <- sapply(i_VEM, function(iter) {
+  adjustedRandIndex(p_herb_LBM$memberships$plantes, apply(res_VEM_p_herb$tau[iter,,], 1, which.max))
+})
+
+df_VEM <- data.frame(
+  iteration = rep(i_VEM, 2),
+  ARI = c(ari_rows_VEM, ari_cols_VEM),
+  Type = factor(rep(c("Plants", "Herbivores"), each = length(i_VEM))),
+  Method = "VEM"
+)
+
+# --- MCMC ---
+ari_cols_MCMC <- sapply(i_MCMC, function(iter) {
+  adjustedRandIndex(p_herb_LBM$memberships$herbivores, res_MCMC_p_herb$W[iter, ])
+})
+
+ari_rows_MCMC <- sapply(i_MCMC, function(iter) {
+  adjustedRandIndex(p_herb_LBM$memberships$plantes, res_MCMC_p_herb$Z[iter, ])
+})
+
+df_MCMC <- data.frame(
+  iteration = rep(i_MCMC, 2),
+  ARI = c(ari_rows_MCMC, ari_cols_MCMC),
+  Type = factor(rep(c("Plants", "Herbivores"), each = length(i_MCMC))),
+  Method = "MCMC"
+)
+
+# --- Combine both ---
+df_all <- rbind(df_VEM, df_MCMC)
+
+# --- Création du label combiné ---
+df_all$Label <- paste(df_all$Method, df_all$Type, sep = " - ")
+
+# --- Tracé combiné ---
+p_all <- ggplot(df_all, aes(x = iteration, y = ARI, color = Label)) +
+  geom_line(linewidth = 1) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "gray50", linewidth = 0.5) +
+  annotate("rect", xmin = 100, xmax = max(df_all$iteration), ymin = -Inf, ymax = Inf, 
+           alpha = 0.1, fill = "red") +
+  labs(
+    title = "Adjusted Rand Index Convergence",
+    subtitle = "Herbivory Network - Pristine Island",
+    x = "Iteration",
+    y = "ARI",
+    color = "Method - Clustering"
+  ) +
+  scale_color_manual(values = custom_colors) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    legend.position = "bottom",
+    legend.box = "vertical",
+    legend.title = element_text(size = 10, face = "bold"),
+    legend.text = element_text(size = 9)
+  )
+
+print(p_all)
+```
+
+```{r}
+res_VEM_d_pred <- VEM_LBM(d_pred_mat, d_pred_LBM$nbBlocks[1], d_pred_LBM$nbBlocks[2])
+res_MCMC_d_pred <- gibbs_LBM(d_pred_mat, d_pred_LBM$nbBlocks[1], d_pred_LBM$nbBlocks[2], n_iter = 150)
+
+# --- Compute ARI for both algorithms ---
+i_VEM <- 1:res_VEM_d_pred$n_iter
+i_MCMC <- 1:150
+
+# --- VEM ---
+ari_cols_VEM <- sapply(i_VEM, function(iter) {
+  adjustedRandIndex(d_pred_LBM$memberships$prédateurs, apply(res_VEM_d_pred$xi[iter,,], 1, which.max))
+})
+
+ari_rows_VEM <- sapply(i_VEM, function(iter) {
+  adjustedRandIndex(d_pred_LBM$memberships$proies, apply(res_VEM_d_pred$tau[iter,,], 1, which.max))
+})
+
+df_VEM <- data.frame(
+  iteration = rep(i_VEM, 2),
+  ARI = c(ari_rows_VEM, ari_cols_VEM),
+  Type = factor(rep(c("Preys", "Predators"), each = length(i_VEM))),
+  Method = "VEM"
+)
+
+# --- MCMC ---
+ari_cols_MCMC <- sapply(i_MCMC, function(iter) {
+  adjustedRandIndex(d_pred_LBM$memberships$prédateurs, res_MCMC_d_pred$W[iter, ])
+})
+
+ari_rows_MCMC <- sapply(i_MCMC, function(iter) {
+  adjustedRandIndex(d_pred_LBM$memberships$proies, res_MCMC_d_pred$Z[iter, ])
+})
+
+df_MCMC <- data.frame(
+  iteration = rep(i_MCMC, 2),
+  ARI = c(ari_rows_MCMC, ari_cols_MCMC),
+  Type = factor(rep(c("Preys", "Predators"), each = length(i_MCMC))),
+  Method = "MCMC"
+)
+
+# --- Combine both ---
+df_all <- rbind(df_VEM, df_MCMC)
+
+# --- Création du label combiné ---
+df_all$Label <- paste(df_all$Method, df_all$Type, sep = " - ")
+
+
+# --- Tracé combiné ---
+p_all <- ggplot(df_all, aes(x = iteration, y = ARI, color = Label)) +
+  geom_line(linewidth = 1) +
+  labs(
+    title = "Adjusted Rand Index Convergence",
+    subtitle = "Predation Network - Disturbed Island",
+    x = "Iteration",
+    y = "ARI",
+    color = "Method - Clustering"
+  ) +
+  scale_color_manual(values = custom_colors) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    legend.position = "bottom",
+    legend.box = "vertical",
+    legend.title = element_text(size = 10, face = "bold"),
+    legend.text = element_text(size = 9)
+  )
+
+print(p_all)
+```
+
+```{r}
+res_VEM_d_herb <- VEM_LBM(d_herb_mat, d_herb_LBM$nbBlocks[1], d_herb_LBM$nbBlocks[2])
+res_MCMC_d_herb <- gibbs_LBM(d_herb_mat, d_herb_LBM$nbBlocks[1], d_herb_LBM$nbBlocks[2], n_iter = 100)
+
+# --- Compute ARI for both algorithms ---
+i_VEM <- 1:res_VEM_d_herb$n_iter
+i_MCMC <- 1:100
+
+# --- VEM ---
+ari_cols_VEM <- sapply(i_VEM, function(iter) {
+  adjustedRandIndex(d_herb_LBM$memberships$herbivores, apply(res_VEM_d_herb$xi[iter,,], 1, which.max))
+})
+
+ari_rows_VEM <- sapply(i_VEM, function(iter) {
+  adjustedRandIndex(d_herb_LBM$memberships$plantes, apply(res_VEM_d_herb$tau[iter,,], 1, which.max))
+})
+
+df_VEM <- data.frame(
+  iteration = rep(i_VEM, 2),
+  ARI = c(ari_rows_VEM, ari_cols_VEM),
+  Type = factor(rep(c("Plants", "Herbivores"), each = length(i_VEM))),
+  Method = "VEM"
+)
+
+# --- MCMC ---
+ari_cols_MCMC <- sapply(i_MCMC, function(iter) {
+  adjustedRandIndex(d_herb_LBM$memberships$herbivores, res_MCMC_d_herb$W[iter, ])
+})
+
+ari_rows_MCMC <- sapply(i_MCMC, function(iter) {
+  adjustedRandIndex(d_herb_LBM$memberships$plantes, res_MCMC_d_herb$Z[iter, ])
+})
+
+df_MCMC <- data.frame(
+  iteration = rep(i_MCMC, 2),
+  ARI = c(ari_rows_MCMC, ari_cols_MCMC),
+  Type = factor(rep(c("Plants", "Herbivores"), each = length(i_MCMC))),
+  Method = "MCMC"
+)
+
+# --- Combine both ---
+df_all <- rbind(df_VEM, df_MCMC)
+
+# --- Création du label combiné ---
+df_all$Label <- paste(df_all$Method, df_all$Type, sep = " - ")
+
+# --- Tracé combiné ---
+p_all <- ggplot(df_all, aes(x = iteration, y = ARI, color = Label)) +
+  geom_line(linewidth = 1) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "gray50", linewidth = 0.5) +
+  annotate("rect", xmin = 100, xmax = max(df_all$iteration), ymin = -Inf, ymax = Inf, 
+           alpha = 0.1, fill = "red") +
+  labs(
+    title = "Adjusted Rand Index Convergence",
+    subtitle = "Herbivory Network - Disturbed Island",
+    x = "Iteration",
+    y = "ARI",
+    color = "Method - Clustering"
+  ) +
+  scale_color_manual(values = custom_colors) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    legend.position = "bottom",
+    legend.box = "vertical",
+    legend.title = element_text(size = 10, face = "bold"),
+    legend.text = element_text(size = 9)
+  )
+
+print(p_all)
+```
